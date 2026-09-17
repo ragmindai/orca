@@ -63,6 +63,20 @@ function stateFile(
   return path
 }
 
+function membershipFile(
+  membership: Record<string, string[]> = {
+    existingOnly: ['production-gce-c1'],
+    migrationOnly: [],
+    general: []
+  }
+): string {
+  const directory = mkdtempSync(join(tmpdir(), 'relay-live-preflight-selector-'))
+  directories.push(directory)
+  const path = join(directory, 'selector.json')
+  writeFileSync(path, JSON.stringify(membership))
+  return path
+}
+
 function sample(): IncidentSample {
   const observedAt = new Date(now).toISOString()
   const signal = (value: number) => ({ value, observedAt })
@@ -571,6 +585,135 @@ describe('relay incident live preflight', () => {
     )).rejects.toThrow('cloud-monitoring/source_stale')
     expect(collect).toHaveBeenCalledTimes(5)
     expect(wait).toHaveBeenCalledTimes(4)
+  })
+
+
+  // Why: the same-cap break-glass skips the sealed 15-minute aggregate evidence,
+  // so this live recheck is the only thing left standing between the dispatch and
+  // a mutation. It must judge the fleet exactly as it does with evidence, and it
+  // must never accept a half-specified override.
+  describe('break-glass without monitor state', () => {
+    const overrideArgs = (extra: string[] = []) => [
+      '--no-monitor-state',
+      '--expected-selector-generation', '1',
+      '--selector-membership-file', membershipFile(),
+      ...extra
+    ]
+
+    it('accepts one complete fresh green sample with no sealed evidence', async () => {
+      await expect(runIncidentLivePreflight(
+        overrideArgs(),
+        { now: () => now, collect: async () => sample() }
+      )).resolves.toBeUndefined()
+    })
+
+    it('fails closed on a live threshold breach', async () => {
+      const hot = async () => {
+        const next = sample()
+        next.sources['cloud-monitoring']!.signals['cloud_sql.cpu']!.value = 0.99
+        return next
+      }
+      await expect(runIncidentLivePreflight(
+        overrideArgs(),
+        { now: () => now, collect: hot, wait: async () => {} }
+      )).rejects.toThrow('cloud-monitoring/threshold_max cloud_sql.cpu')
+    })
+
+    it('fails closed on a live selector mismatch', async () => {
+      const drifted = async () => {
+        const next = sample()
+        next.selector = { ...selector, generation: 7 }
+        return next
+      }
+      await expect(runIncidentLivePreflight(
+        overrideArgs(),
+        { now: () => now, collect: drifted, wait: async () => {} }
+      )).rejects.toThrow('selector')
+    })
+
+    it('expects the wave-adjusted live selector generation', async () => {
+      const seen: AdmissionSelector[] = []
+      const collect = async (expected: AdmissionSelector) => {
+        seen.push(expected)
+        return sample()
+      }
+      await expect(runIncidentLivePreflight(
+        overrideArgs(['--wave-index', '2']),
+        { now: () => now, collect }
+      )).resolves.toBeUndefined()
+      expect(seen[0]!.generation).toBe(5)
+    })
+
+    it('pins the strictest migration policy', async () => {
+      // An inactive migration target is tolerable only under recover-forward,
+      // and an override cannot elect that policy, so this must still fail.
+      const inactiveTarget = sample()
+      inactiveTarget.sources['director-admin']!.signals[
+        'cell.production-gce-c1.migration_target_inactive'
+      ]!.value = 30
+      await expect(runIncidentLivePreflight(
+        overrideArgs(),
+        { now: () => now, collect: async () => inactiveTarget, wait: async () => {} }
+      )).rejects.toThrow('director-admin/threshold_max')
+    })
+
+    it('rejects a half-specified override', async () => {
+      const cases: string[][] = [
+        ['--no-monitor-state'],
+        ['--no-monitor-state', '--expected-selector-generation', '1'],
+        ['--no-monitor-state', '--selector-membership-file', membershipFile()],
+        // Mixing the two sources would let a caller pass sealed evidence it
+        // never wants read.
+        [
+          '--no-monitor-state',
+          '--expected-selector-generation', '1',
+          '--selector-membership-file', membershipFile(),
+          '--state-file', stateFile()
+        ],
+        // Override arguments without the flag must not be silently ignored.
+        ['--state-file', stateFile(), '--expected-selector-generation', '1'],
+        ['--no-monitor-state', '--no-monitor-state'],
+        ['--expected-selector-generation', '1']
+      ]
+      for (const args of cases) {
+        await expect(runIncidentLivePreflight(
+          args,
+          { now: () => now, collect: async () => sample() }
+        )).rejects.toThrow('usage:')
+      }
+    })
+
+    it('rejects an unknown option and a negative generation', async () => {
+      await expect(runIncidentLivePreflight(
+        overrideArgs(['--skip-everything']),
+        { now: () => now, collect: async () => sample() }
+      )).rejects.toThrow('usage:')
+      await expect(runIncidentLivePreflight(
+        [
+          '--no-monitor-state',
+          '--expected-selector-generation', '-1',
+          '--selector-membership-file', membershipFile()
+        ],
+        { now: () => now, collect: async () => sample() }
+      )).rejects.toThrow()
+    })
+
+    it('re-samples a tolerable failure and then passes', async () => {
+      let samples = 0
+      const collect = async () => {
+        samples++
+        const next = sample()
+        if (samples === 1) {
+          next.sources['cloud-monitoring']!.signals['director.instances']!.value = 2
+        }
+        return next
+      }
+      await expect(runIncidentLivePreflight(
+        overrideArgs(),
+        { now: () => now, collect, wait: async () => {} }
+      )).resolves.toBeUndefined()
+      expect(samples).toBe(2)
+    })
   })
 
   it('uses the supplied admin token without minting through gcloud', async () => {
