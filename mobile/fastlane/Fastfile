@@ -223,6 +223,11 @@ platform :ios do
 
     upload_to_testflight(
       api_key: api_key,
+      # Explicit: without this, fastlane falls back to the Appfile's
+      # app_identifier, which is a DIFFERENT resolution path from BUNDLE_ID and
+      # silently uploaded against the upstream app ("Couldn't find app
+      # 'com.stably.orca.mobile'") after a clean 15-minute archive.
+      app_identifier: BUNDLE_ID,
       # Distribution runs separately so a processing timeout can be retried
       # against this exact build without uploading another binary.
       skip_waiting_for_build_processing: true,
