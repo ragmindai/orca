@@ -22,6 +22,15 @@ on:
         description: 'Optional TestFlight external tester changelog'
         required: false
         type: string
+      distribute_external:
+        description: 'Also distribute to an EXTERNAL TestFlight group. Internal testers always get the build automatically, so leave this off unless an external group exists and has cleared Beta App Review.'
+        required: false
+        default: false
+        type: boolean
+      testflight_groups:
+        description: 'Comma-separated EXTERNAL TestFlight group names, when distribute_external is on.'
+        required: false
+        type: string
 
 jobs:
   ios-build:
@@ -155,6 +164,11 @@ jobs:
   ios-distribute:
     name: Distribute to external TestFlight testers
     needs: ios-build
+    # Off by default: the build reaches INTERNAL testers automatically as soon as
+    # processing completes, so this job is purely the external path. Leaving it
+    # always-on made every successful release report failure, which trains people
+    # to ignore a red run.
+    if: ${{ inputs.distribute_external == true }}
     runs-on: ubuntu-latest
     # Fastlane's processing wait fails after 20m; this outer bound leaves setup
     # margin without allowing App Store Connect polling to hang for hours.
@@ -179,12 +193,14 @@ jobs:
           bundler-cache: true
           working-directory: mobile
 
-      - name: Wait for processing and distribute to peeps
+      - name: Wait for processing and distribute to external testers
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
           TESTFLIGHT_CHANGELOG: ${{ github.event.inputs.testflight_changelog }}
+          IOS_BUNDLE_IDENTIFIER: ai.ragmind.orca
+          TESTFLIGHT_GROUPS: ${{ github.event.inputs.testflight_groups }}
           MOBILE_IOS_RELEASE_VERSION: ${{ needs.ios-build.outputs.release_version }}
           MOBILE_IOS_BUILD_NUMBER: ${{ needs.ios-build.outputs.build_number }}
           FASTLANE_SKIP_UPDATE_CHECK: '1'
@@ -193,6 +209,6 @@ jobs:
           if ! bundle exec fastlane ios distribute_testflight \
             version:"$MOBILE_IOS_RELEASE_VERSION" \
             build_number:"$MOBILE_IOS_BUILD_NUMBER"; then
-            echo "::error::TestFlight $MOBILE_IOS_RELEASE_VERSION ($MOBILE_IOS_BUILD_NUMBER) was uploaded but not distributed to peeps. If App Store Connect is still processing it, rerun only this failed job after the build becomes Ready; otherwise inspect the Fastlane error above."
+            echo "::error::TestFlight $MOBILE_IOS_RELEASE_VERSION ($MOBILE_IOS_BUILD_NUMBER) was uploaded but not distributed to the external group. If App Store Connect is still processing it, rerun only this failed job after the build becomes Ready; otherwise inspect the Fastlane error above."
             exit 1
           fi
