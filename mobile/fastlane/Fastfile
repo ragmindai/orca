@@ -28,8 +28,25 @@ APP_CONFIG_PATH = File.join(MOBILE_ROOT, "app.json")
 WORKSPACE = File.join(MOBILE_ROOT, "ios", "Orca.xcworkspace")
 BUILD_OUTPUT_DIRECTORY = File.join(MOBILE_ROOT, "build")
 SCHEME = "Orca"
-BUNDLE_ID = "com.stably.orca.mobile"
-TESTFLIGHT_GROUPS = ["peeps"].freeze
+# Why not ENV.fetch: it falls back only when the variable is ABSENT, so a
+# variable set to "" or "   " reaches the constant intact. Both of these feed
+# App Store Connect lookups, where a blank value fails late and confusingly.
+def self.env_or(name, fallback)
+  raw = ENV[name].to_s.strip
+  raw.empty? ? fallback : raw
+end
+
+BUNDLE_ID = env_or("IOS_BUNDLE_IDENTIFIER", "ai.ragmind.orca")
+
+# reject(&:empty?) guards ",," and " , ", which would otherwise yield [""] or [].
+# An EMPTY list is the dangerous one: fastlane treats `groups: []` as "no groups"
+# and completes the release without distributing to anyone, rather than erroring.
+TESTFLIGHT_GROUPS = begin
+  groups = env_or("TESTFLIGHT_GROUPS", "peeps").split(",").map(&:strip).reject(&:empty?)
+  raise ArgumentError, "TESTFLIGHT_GROUPS must name at least one group" if groups.empty?
+
+  groups.freeze
+end
 DEFAULT_TESTFLIGHT_CHANGELOG = "Latest Orca Mobile updates and fixes.".freeze
 TESTFLIGHT_PROCESSING_TIMEOUT_SECONDS = 20 * 60
 
@@ -223,6 +240,11 @@ platform :ios do
 
     upload_to_testflight(
       api_key: api_key,
+      # Explicit: without this, fastlane falls back to the Appfile's
+      # app_identifier, which is a DIFFERENT resolution path from BUNDLE_ID and
+      # silently uploaded against the upstream app ("Couldn't find app
+      # 'com.stably.orca.mobile'") after a clean 15-minute archive.
+      app_identifier: BUNDLE_ID,
       # Distribution runs separately so a processing timeout can be retried
       # against this exact build without uploading another binary.
       skip_waiting_for_build_processing: true,
